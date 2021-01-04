@@ -44,20 +44,38 @@ Options:
 #     = 337984
 # https://discord.com/api/oauth2/authorize?client_id=791729943725735987&permissions=337984&scope=bot
 
+WORD_SOURCE_LIST = 1
+WORD_SOURCE_REJECTED = 2
+WORD_SOURCE_GAME = 3
+WORD_SOURCE_VETTED = 4
+
+MESSAGE_STATE_UNKNOWN = 0
+MESSAGE_STATE_OK = 1
+MESSAGE_STATE_REPEAT = 2
+MESSAGE_STATE_REJECTED = 3
+
 EMOJI_NAY = '🚫'
+EMOJI_THUMB_UP = '👍'
+EMOJI_THUMB_DOWN = '👎'
+EMOJI_THUMB_OWL = '🦉'
+EMOJI_QUESTION = '❓'
+EMOJI_THINKING_FACE = '🤔'
+EMOJI_RECYCLE = '♻️'
+
 
 import re
 import sys
 import time
+import shlex
+import docopt
+import pprint
 import logging
 import datetime
 
 from izaber import initialize, config
 
-import shlex
+import timeago
 
-import pprint
-import docopt
 import peewee as pw
 from playhouse.db_url import connect
 
@@ -93,6 +111,11 @@ class BaseModel(pw.Model):
 class Words(BaseModel):
     id = pw.BigAutoField()
     word = pw.CharField(unique=True)
+    source = pw.IntegerField(null=True, index=True)
+
+class BannedWords(BaseModel):
+    id = pw.BigAutoField()
+    word = pw.CharField(unique=True)
 
 class Channels(BaseModel):
     id = pw.BigAutoField()
@@ -106,18 +129,20 @@ class Games(BaseModel):
     timestamp = pw.DateTimeField(index=True)
     channel = pw.ForeignKeyField(Channels, backref='games', on_delete='CASCADE', index=True)
 
-class User(BaseModel):
+class Users(BaseModel):
     id = pw.BigAutoField()
-    user_id = pw.BigIntegerField(unique=True)
-    name = pw.CharField()
+    discord_user_id = pw.BigIntegerField(unique=True)
+    name = pw.CharField(null=True)
 
 class Messages(BaseModel):
     id = pw.BigAutoField()
     timestamp = pw.DateTimeField(index=True)
+    state = pw.IntegerField(index=True)
     content = pw.TextField()
     word = pw.ForeignKeyField(Words, backref='messages', on_delete='CASCADE', index=True)
     game = pw.ForeignKeyField(Games, backref='game', on_delete='CASCADE', index=True, null=True)
     channel = pw.ForeignKeyField(Channels, backref='messages', on_delete='CASCADE', index=True)
+    user = pw.ForeignKeyField(Users, backref='messages', index=True)
     # author
     # message
 
@@ -131,18 +156,20 @@ class Messages(BaseModel):
     #   value=0>>
 
 
-MODELS = [ Words, Channels, Games, Messages ]
+MODELS = [ Words, BannedWords, Channels, Games, Users, Messages ]
 
 class Iha(discord.Client):
 
     _db = None
     _channel_cache = None
     _word_cache = None
+    _user_cache = None
 
     def __init__(self, db_url, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._word_cache = {}
         self._channel_cache = {}
+        self._user_cache = {}
         self.db_conn(db_url)
         self.init()
 
@@ -159,7 +186,7 @@ class Iha(discord.Client):
             database.create_tables(MODELS)
         return self._db
 
-    def parse_message(self, clean_content):
+    def parse_message(self, message):
         """ Parse the message string
 
         We expect the message to be in the form:
@@ -169,7 +196,7 @@ class Iha(discord.Client):
         words - comment
         words (comment)
         """
-
+        clean_content = message.clean_content
         elements = re.split('([ \(:!?])', clean_content.lower())
         word = []
         for element in elements:
@@ -180,7 +207,7 @@ class Iha(discord.Client):
         word = " ".join(word)
         return word
 
-    def is_game_channel(self, channel):
+    def channel_get(self, channel):
         """ Returns a truthy value if the channel is one that we
             consider a part of the game
         """
@@ -200,20 +227,41 @@ class Iha(discord.Client):
 
         return self._channel_cache[discord_id]
         
+    def user_upsert(self, user):
+        """ Returns the database record for the user provided.
+            If user is not found in the database, will create it
+            and return the new record.
+        """
+        discord_user_id = user.id
 
-    def word_upsert(self, word):
-        """ Returns the database id for the word provided.
+        if discord_user_id not in self._user_cache:
+            ( user_rec, created ) = Users.get_or_create(discord_user_id=discord_user_id)
+            if created:
+                user_rec.name = f"{user.name}#{user.discriminator}"
+                user_rec.save()
+            self._user_cache[discord_user_id] = user_rec
+
+        return self._user_cache[discord_user_id]
+
+
+    def word_upsert(self, word, source):
+        """ Returns the database record for the word provided.
             If word is not found in the database, will create it
-            and return the new id
+            and return the new record. We need to record the
+            original source of the word. Right now the dictionary
+            is shared across all games and servers so eventually
+            it would be good to isolate the dictionaries
         """
 
-        # Just normalize it. Shouldn't be required but
-        # just in case.
+        # Just normalize it. Shouldn't be required but just in case.
         word = word.lower().strip()
 
         if not word in self._word_cache:
-            ( word_rec, created ) = Words.get_or_create(word = word)
-            self._word_cache[word] = word_rec.id
+            ( word_rec, created ) = Words.get_or_create(word=word)
+            if created:
+                word_rec.source = source
+                word_rec.save()
+            self._word_cache[word] = word_rec
 
         return self._word_cache[word]
 
@@ -229,32 +277,30 @@ class Iha(discord.Client):
 
         chan = await self.fetch_channel(discord_id)
         async for message in chan.history(limit=None, after=max_timestamp):
-            word = self.parse_message(message.clean_content)
+            word = self.parse_message(message)
             if not word:
                 continue
 
-            word_id = self.word_upsert(word)
+            word_rec = self.word_upsert(word)
             message = Messages.create(
                           timestamp=message.created_at,
                           content=message.clean_content,
-                          word=word_id,
+                          word=word_rec.id,
                           channel=channel_id,
                       )
-            print(message, word_id, word)
-
 
     async def channel_add(self, channel):
         """ Loads a channel into the system
         """
-        ( chan_rec, created ) = Channels.get_or_create(discord_id = channel.id)
+        discord_id = channel.id
+        ( chan_rec, created ) = Channels.get_or_create(discord_id=discord_id)
         if chan_rec.name != channel.name:
             chan_rec.name = channel.name
             chan_rec.save()
 
-        self._channel_cache[channel.id] = chan_rec
+        self._channel_cache[discord_id] = chan_rec
 
-        # Load the history
-        await self.channel_sync(channel)
+        return chan_rec
 
     async def channel_info(self, channel):
         """ Reports information associated with the channel
@@ -272,6 +318,7 @@ class Iha(discord.Client):
                 'name': chan.name,
                 'messages': messages,
                 'game_running': chan.game_running,
+                'current_game': chan.current_game,
             }
 
             return data
@@ -294,17 +341,140 @@ class Iha(discord.Client):
         except pw.DoesNotExist:
             return False
 
+    async def channel_message(self, message):
+        """ Sends a message into a channel and if it's a game channel and the game
+            is active, let's see about processing it
+        """
+        ########################################################
+        # Gatekeep
+        ########################################################
+        channel_rec = self.channel_get(message.channel)
+
+        # Ignore if the channel isn't recognized
+        if not channel_rec: return
+
+        # Ignore if there's no game going on
+        if not channel_rec.game_running: return
+
+        ########################################################
+        # Message Contents handling
+        ########################################################
+        # Do we recognize this as a word message?
+        word = self.parse_message(message)
+        if not word:
+            return
+
+        # Cool! Then let's find information on the word and start the comparison
+        # process.
+        word_rec = self.word_upsert(word, WORD_SOURCE_GAME)
+
+        reject_word = False
+        reply_messages = []
+
+        # If it's a rejected word, we ignore it
+        if word_rec.source == WORD_SOURCE_REJECTED:
+            reject_word = True
+            reply_messages.append(f"{word} has previously been rejected.")
+            await message.add_reaction(EMOJI_THUMB_DOWN)
+
+        # Okay, so what sort of word is it?
+        if word_rec.source == WORD_SOURCE_GAME:
+            await message.add_reaction(EMOJI_THINKING_FACE)
+            message_state = MESSAGE_STATE_UNKNOWN
+        else:
+            message_state = MESSAGE_STATE_OK
+
+        ########################################################
+        # Apply the rules
+        ########################################################
+
+        # The "current_game" should have information on the
+        # game's current status
+        game_rec = channel_rec.current_game
+
+        # What was the last valid message?
+        try:
+            last_message = Messages.select()\
+                               .join(Words)\
+                               .where(
+                                   Messages.game == game_rec,
+                                   Messages.state.in_([MESSAGE_STATE_UNKNOWN,MESSAGE_STATE_OK])
+                               )\
+                               .order_by(Messages.timestamp.desc())\
+                               .get()
+
+
+            # Get the last letter
+            last_letter = last_message.word.word[-1]
+
+            # Does the current letter match the expect
+            if word[0] != last_letter:
+                await message.add_reaction(EMOJI_NAY)
+                reply_messages.append(f"The word must start with the letter '{last_letter.upper()}'")
+                reject_word = True
+        except pw.DoesNotExist:
+            pass
+
+        # Let's check to see if the word has already been used
+        messages = list(Messages.select()\
+                           .where(
+                               Messages.game == game_rec,
+                               Messages.word == word_rec,
+                           ))
+
+        # If there have been any messages found, it means that
+        # the word has already been used in this game. We ignore it
+        if messages:
+            await message.add_reaction(EMOJI_RECYCLE)
+            repeat_message = messages[0]
+            now = datetime.datetime.now()
+            timeago_str = timeago.format(repeat_message.timestamp,now)
+            reply_messages.append(
+                f"The word was previously used by <@{repeat_message.user.discord_user_id}> {timeago_str}"
+            )
+            reject_word = True
+
+
+        # If we need to reply to the message for any reason, let's take care
+        # of that.
+        if reply_messages:
+            reply_str = ''
+            for m in reply_messages:
+                reply_str += f"- {m}\n"
+            await message.reply(reply_str)
+
+        # And if there's any reason to reject the word let's 
+        # drop out.
+        if reject_word:
+            return
+
+        # Get the user information logged
+        user_rec = self.user_upsert(message.author)
+
+        # Then record the message for future reference
+        message = Messages.create(
+                      timestamp=message.created_at,
+                      content=message.clean_content,
+                      word=word_rec,
+                      game=game_rec,
+                      channel=channel_rec,
+                      state=message_state,
+                      user=user_rec,
+                  )
+
+        return message
+
     async def game_start(self, channel):
         """ Starts a new game in the current channel. If a game is already active,
             will throw back a warning message
         """
 
         # Check if this is a game channel
-        if not self.is_game_channel(channel):
+        channel_rec = self.channel_get(channel)
+        if not channel_rec:
             raise Exception("Not a game channel")
 
         # Check to see if the game is in session
-        channel_rec = Channels.get(Channels.discord_id == channel.id)
         if channel_rec.game_running:
             raise Exception(f"Game is already running in {channel_rec.name}")
 
@@ -325,7 +495,7 @@ class Iha(discord.Client):
         """
 
         # Check if this is a game channel
-        if not self.is_game_channel(channel):
+        if not self.channel_get(channel):
             raise Exception("Not a game channel")
 
         # Ensure that a game is in session
@@ -369,7 +539,7 @@ class Iha(discord.Client):
             # Channel Commands
             elif args['add']:
                 await self.channel_add(message.channel)
-                await message.channel.send(f":white_check_mark: **{message.channel.name}** Added.")
+                await message.channel.send(f":white_check_mark: **{message.channel.name}** Added. Start a new game with `@iha start`")
             elif args['sync']:
                 await self.channel_sync(message.channel)
                 await message.channel.send(f":white_check_mark: **{message.channel.name}** Syncronized")
@@ -381,13 +551,17 @@ class Iha(discord.Client):
                         f"Currently logged {info['messages']} message(s)."
                     )
                     if info['game_running']:
-                        await message.channel.send(f"Currently in game. Started {info['game_running'].timestamp}!")
+                        now = datetime.datetime.now()
+                        timeago_str = timeago.format(info['current_game'].timestamp,now)
+                        await message.channel.send(f"Currently in game. Started {timeago_str}!")
                     else:
                         await message.channel.send(f"No game in session.")
                 else:
                     await message.channel.send(f"**{message.channel.name}** is not a registered channel.")
+
             elif args['remove']:
                 await self.channel_remove(message.channel)
+                await message.channel.send(f"**{message.channel.name}** removed.")
 
             # Game commands
             elif args['start']:
@@ -398,6 +572,10 @@ class Iha(discord.Client):
                 await self.game_end(message.channel)
                 await message.channel.send(f"**{message.channel.name}** game ended.")
 
+            # Process a message without treating it as a command
+            else:
+                raise Exception(f"Unknown Command! {command}")
+
             pprint.pprint(args)
         except docopt.DocoptExit as ex:
             await message.channel.send(f"Parser Error: {ex}")
@@ -407,17 +585,7 @@ class Iha(discord.Client):
     async def on_ready(self):
         print('Logged on as {0}!'.format(self.user))
 
-        """
-        for chan_id in SHIRITORI_CHANNELS:
-            chan = await self.fetch_channel(chan_id)
-            async for message in chan.history(limit=None):
-                print(message)
-        """
-
     async def on_message(self, message):
-        print(message.channel.id)
-        print('Message from {0.author}: {0.content}'.format(message))
-        print("????", message.author, self.user)
         if message.author == self.user:
             return
 
@@ -425,20 +593,8 @@ class Iha(discord.Client):
         if self.user.id in message.raw_mentions:
             return await self.command_execute(message)
 
-        # Don't need to do anything if this is a message in a channel
-        # we don't care about
-        if not self.is_game_channel(message.channel):
-            return
-
         # Process shiritori?
-        print("GONNA RESPOND", message.channel.id)
-        """
-        if message.channel.id in SHIRITORI_CHANNELS:
-            await message.add_reaction(EMOJI_NAY)
-            #await message.add_reaction('<:science:792107970703261717>')
-            #emojis = self.get_all_emojis()
-            #await message.channel.send("Something!")
-        """
+        await self.channel_message(message)
 
     async def on_reaction_add(self, reaction, user):
         print(f"Reaction from {user}: {reaction}")
@@ -459,7 +615,8 @@ def do_load(args):
             words = []
             for l in f:
                 words.append({
-                  'word': l.strip()
+                  'word': l.strip(),
+                  'source': WORD_SOURCE_LIST,
                 })
                 if len(words) > 1000:
                     break
@@ -488,7 +645,6 @@ def main(args):
         return do_wipe(args)
     elif args['run']:
         return do_run(args)
-
 
 
 if __name__ == '__main__':
