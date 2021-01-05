@@ -13,4 +13,4 @@ timeago = "*"
 "discord.py" = {editable = true, git = "https://github.com/Rapptz/discord.py"}
 
 [requires]
-python_version = "3.9"
+python_version = "3"
