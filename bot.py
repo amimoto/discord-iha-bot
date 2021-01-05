@@ -195,6 +195,8 @@ class Iha(discord.Client):
         word word...
         words - comment
         words (comment)
+
+        We will return the word tokens as a list
         """
         clean_content = message.clean_content
         elements = re.split('([ \(:!?])', clean_content.lower())
@@ -204,8 +206,9 @@ class Iha(discord.Client):
             if not re.search(r'^[a-z]',element):
                 break
             word.append(element)
-        word = " ".join(word)
+
         return word
+
 
     def channel_get(self, channel):
         """ Returns a truthy value if the channel is one that we
@@ -360,9 +363,12 @@ class Iha(discord.Client):
         # Message Contents handling
         ########################################################
         # Do we recognize this as a word message?
-        word = self.parse_message(message)
-        if not word:
+        # We ignore the message if there is no word found
+        # OR if there is more than 1 word
+        words = self.parse_message(message)
+        if not words or len(words) > 1:
             return
+        word = words[0]
 
         # Cool! Then let's find information on the word and start the comparison
         # process.
